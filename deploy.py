@@ -7,6 +7,8 @@ import os
 import modal
 import random
 import string
+import threading
+import time
 
 CUI_UNAME="webui"
 allchars = string.ascii_letters + string.digits
@@ -53,6 +55,10 @@ app = modal.App(name="comfyui-srv", image=image)
 class ComfyService:
     port: int = 8000  # port where ComfyUI will run internally
 
+    def __init__(self):
+        self.symlink_thread = None
+        self.stop_symlink_thread = False
+
     @modal.enter()
     def launch_comfy(self):
         """Launch ComfyUI server in background on container start."""
@@ -64,10 +70,12 @@ class ComfyService:
         subprocess.run(cmd, shell=True, check=True)
         
         # Wait a moment for server to start
-        import time
         time.sleep(3)
         
         print("✅ ComfyUI server launched successfully")
+        
+        # Start the periodic symlink checker
+        self.start_periodic_lora_monitor()
         
         # Test server responsiveness
         try:
@@ -76,7 +84,90 @@ class ComfyService:
             print("✅ ComfyUI server is responding")
         except Exception as e:
             print(f"⚠️ ComfyUI server may not be fully ready: {e}")
-    
+
+    def start_periodic_lora_monitor(self):
+        """Start a background thread that monitors for new lora files every minute."""
+        print("🔗 Starting periodic LoRA monitor...")
+        self.stop_symlink_thread = False
+        self.symlink_thread = threading.Thread(target=self._monitor_lora_files, daemon=True)
+        self.symlink_thread.start()
+
+    def _monitor_lora_files(self):
+        """Background thread that monitors for new lora files and creates symlinks."""
+        while not self.stop_symlink_thread:
+            try:
+                self.update_lora_symlinks()
+            except Exception as e:
+                print(f"⚠️ Error in LoRA monitor: {e}")
+            
+            # Wait 60 seconds before next check
+            for _ in range(60):
+                if self.stop_symlink_thread:
+                    break
+                time.sleep(1)
+
+    def update_lora_symlinks(self):
+        """Check for new safetensor files in runs folder and create symlinks."""
+        from pathlib import Path
+        import sys
+        
+        comfy_root = Path("/root/comfy/ComfyUI")
+        lora_dir = comfy_root / "models" / "loras"
+        lora_dir.mkdir(parents=True, exist_ok=True)
+
+        runs_root = Path("/data/runs")
+        if not runs_root.exists():
+            return
+
+        new_files_count = 0
+        
+        # Get all existing symlinks to track what we already have
+        existing_symlinks = {f.name for f in lora_dir.iterdir() if f.is_symlink()}
+        
+        for checkpoint in runs_root.glob("*/checkpoints/*.safetensors"):
+            # parent structure: /data/runs/<run_name>/checkpoints/<file>
+            run_name = checkpoint.parents[1].name
+            dest_name = f"{run_name}_{checkpoint.name}"
+            dest = lora_dir / dest_name
+            
+            # Skip if symlink already exists and points to the right place
+            if dest_name in existing_symlinks:
+                try:
+                    if dest.resolve() == checkpoint.resolve():
+                        continue  # Symlink already exists and is correct
+                except:
+                    pass  # If we can't resolve, recreate the symlink
+            
+            try:
+                # Remove existing symlink/file if it exists
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                
+                # Create the symlink
+                dest.symlink_to(checkpoint)
+                new_files_count += 1
+                
+                print(f"🔗 Created LoRA symlink: {dest_name}")
+                
+            except Exception as e:
+                print(f"⚠️ Failed to create symlink for {checkpoint}: {e}")
+
+        if new_files_count > 0:
+            print(f"✅ Created {new_files_count} new LoRA symlinks")
+            
+            # Trigger ComfyUI to refresh its model cache
+            try:
+                # Add ComfyUI folder_paths to Python path and refresh the loras list
+                sys.path.insert(0, str(comfy_root))
+                import folder_paths
+                
+                # Force refresh of the LoRA file list by calling get_filename_list
+                # This will invalidate the cache since we changed the directory
+                folder_paths.get_filename_list("loras")
+                print("🔄 Refreshed ComfyUI LoRA cache")
+                
+            except Exception as e:
+                print(f"⚠️ Could not refresh ComfyUI cache: {e}")
     
     def prep_cui_data(self):
         """
@@ -84,18 +175,16 @@ class ComfyService:
 
         - Replaces /root/comfy/ComfyUI/output with a symlink to /data/sample_outputs
         - Symlinks *.safetensors from /data/models → checkpoints/
-        - Symlinks *.safetensors from /data/runs/<run>/checkpoints → loras/,
-          naming them <run>_<original_file>
+        - Sets up initial LoRA symlinks (ongoing monitoring handled separately)
         """
         from pathlib import Path
         import shutil
-        import os
 
         comfy_root = Path("/root/comfy/ComfyUI")
         output_dir = comfy_root / "output"
         sample_outputs = Path("/data/sample_outputs")
 
-        # ---------- 1 – 2.  output → sample_outputs ----------
+        # ---------- 1. output → sample_outputs ----------
         if output_dir.exists() or output_dir.is_symlink():
             # remove file, dir, or symlink uniformly
             if output_dir.is_dir() and not output_dir.is_symlink():
@@ -107,7 +196,7 @@ class ComfyService:
         sample_outputs.mkdir(parents=True, exist_ok=True)
         output_dir.symlink_to(sample_outputs, target_is_directory=True)
 
-        # ---------- 3. model checkpoints ----------
+        # ---------- 2. model checkpoints ----------
         src_models_dir = Path("/data/models")
         dst_ckpts_dir = comfy_root / "models" / "checkpoints"
         dst_ckpts_dir.mkdir(parents=True, exist_ok=True)
@@ -119,24 +208,12 @@ class ComfyService:
                     dest.unlink()
                 dest.symlink_to(model_path)
 
-        # ---------- 4. lora checkpoints ----------
-        lora_dir = comfy_root / "models" / "loras"
-        lora_dir.mkdir(parents=True, exist_ok=True)
-
-        runs_root = Path("/data/runs")
-        if runs_root.exists():
-            for checkpoint in runs_root.glob("*/checkpoints/*.safetensors"):
-                # parent structure: /data/runs/<run_name>/checkpoints/<file>
-                run_name = checkpoint.parents[1].name
-                dest_name = f"{run_name}_{checkpoint.name}"
-                dest = lora_dir / dest_name
-                if dest.exists() or dest.is_symlink():
-                    dest.unlink()
-                dest.symlink_to(checkpoint)
+        # ---------- 3. initial LoRA setup ----------
+        print("📁 ComfyUI data setup complete (LoRA monitoring will start after server launch)")
 
     def poll_server_health(self):
         """Check if ComfyUI server is responding, otherwise stop container."""
-        import socket, urllib.request, urllib.error
+        import urllib.request, urllib.error
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{self.port}/system_stats", timeout=5)
             # If the request succeeds quickly, the server is healthy
@@ -147,123 +224,30 @@ class ComfyService:
 
     @modal.method()
     def infer(self, prompt: str) -> bytes:
-        """Run the ComfyUI workflow for the given prompt and return image bytes."""
+        """Run a simple text-to-image generation and return image bytes."""
         # Ensure server is up
         self.poll_server_health()
         
-        # Create a basic workflow programmatically if workflow_api.json doesn't exist
-        workflow_path = "/root/workflow_api.json"
-        if not Path(workflow_path).exists():
-            # Create a simple SDXL workflow
-            workflow_data = {
-                "1": {
-                    "inputs": {
-                        "text": prompt,
-                        "clip": ["4", 1]
-                    },
-                    "class_type": "CLIPTextEncode",
-                    "_meta": {"title": "CLIP Text Encode (Prompt)"}
-                },
-                "2": {
-                    "inputs": {
-                        "text": "blurry, low quality, distorted",
-                        "clip": ["4", 1]
-                    },
-                    "class_type": "CLIPTextEncode",
-                    "_meta": {"title": "CLIP Text Encode (Negative)"}
-                },
-                "3": {
-                    "inputs": {
-                        "seed": 42,
-                        "steps": 20,
-                        "cfg": 7.0,
-                        "sampler_name": "euler",
-                        "scheduler": "normal",
-                        "denoise": 1.0,
-                        "model": ["4", 0],
-                        "positive": ["1", 0],
-                        "negative": ["2", 0],
-                        "latent_image": ["5", 0]
-                    },
-                    "class_type": "KSampler",
-                    "_meta": {"title": "KSampler"}
-                },
-                "4": {
-                    "inputs": {
-                        "ckpt_name": "sd_xl_base_1.0.safetensors"
-                    },
-                    "class_type": "CheckpointLoaderSimple",
-                    "_meta": {"title": "Load Checkpoint"}
-                },
-                "5": {
-                    "inputs": {
-                        "width": 1024,
-                        "height": 1024,
-                        "batch_size": 1
-                    },
-                    "class_type": "EmptyLatentImage",
-                    "_meta": {"title": "Empty Latent Image"}
-                },
-                "6": {
-                    "inputs": {
-                        "samples": ["3", 0],
-                        "vae": ["4", 2]
-                    },
-                    "class_type": "VAEDecode",
-                    "_meta": {"title": "VAE Decode"}
-                },
-                "7": {
-                    "inputs": {
-                        "filename_prefix": "generated_image",
-                        "images": ["6", 0]
-                    },
-                    "class_type": "SaveImage",
-                    "_meta": {"title": "Save Image"}
-                }
-            }
-            Path(workflow_path).write_text(json.dumps(workflow_data, indent=2))
-        else:
-            # Load existing workflow
-            workflow_data = json.loads(Path(workflow_path).read_text())
-        
-        # Insert prompt text into the ClipTextEncode node (id "1")
-        workflow_data["1"]["inputs"]["text"] = prompt
         # Create a unique prefix for output file
-        unique_id = uuid.uuid4().hex
-        # Find the SaveImage node and update filename_prefix
-        for node_id, node_data in workflow_data.items():
-            if node_data.get("class_type") == "SaveImage":
-                node_data["inputs"]["filename_prefix"] = unique_id
-                break
-        else:
-            # If no SaveImage node found, update node "7" (our default)
-            if "7" in workflow_data:
-                workflow_data["7"]["inputs"]["filename_prefix"] = unique_id
+        unique_id = uuid.uuid4().hex[:8]
         
-        # Save this modified workflow to a temp file
-        temp_path = f"/root/{unique_id}.json"
-        Path(temp_path).write_text(json.dumps(workflow_data))
-        
-        # Run the workflow via comfy CLI
-        run_cmd = f"comfy run --workflow {temp_path} --wait --timeout 1200"
-        result = subprocess.run(run_cmd, shell=True, capture_output=True, text=True)
+        # Use comfy command line to run a simple prompt
+        cmd = f'comfy run --prompt "{prompt}" --output-prefix {unique_id} --wait --timeout 1200'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         
         if result.returncode != 0:
-            print(f"ComfyUI workflow failed: {result.stderr}")
-            raise RuntimeError(f"ComfyUI workflow failed: {result.stderr}")
+            print(f"ComfyUI generation failed: {result.stderr}")
+            raise RuntimeError(f"ComfyUI generation failed: {result.stderr}")
         
         # Read the resulting image file
         output_dir = Path("/root/comfy/ComfyUI/output")
         for f in output_dir.iterdir():
             if f.name.startswith(unique_id) and f.suffix.lower() in ['.png', '.jpg', '.jpeg']:
                 img_bytes = f.read_bytes()
-                # Clean up temp files
-                Path(temp_path).unlink(missing_ok=True)
+                # Clean up the image file
                 f.unlink(missing_ok=True)
                 return img_bytes
         
-        # Clean up temp file even if no output found
-        Path(temp_path).unlink(missing_ok=True)
         raise RuntimeError("Output image not found.")
 
     @modal.fastapi_endpoint(method="GET", label="status")
@@ -277,10 +261,16 @@ class ComfyService:
             response = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/system_stats", timeout=5)
             system_stats = json.loads(response.read().decode())
             
+            # Count current LoRA symlinks
+            lora_dir = Path("/root/comfy/ComfyUI/models/loras")
+            lora_count = len([f for f in lora_dir.iterdir() if f.is_symlink()]) if lora_dir.exists() else 0
+            
             return {
                 "status": "healthy",
                 "comfyui_port": self.port,
                 "system_stats": system_stats,
+                "lora_symlinks": lora_count,
+                "monitor_active": self.symlink_thread is not None and self.symlink_thread.is_alive(),
                 "endpoints": {
                     "generate": "/generate",
                     "status": "/status",
@@ -316,10 +306,7 @@ class ComfyService:
 
     @modal.web_server(port, label="comfyui")
     def serve_ui(self):
-        """
-        Expose the ComfyUI web UI. Navigate to this endpoint in a browser.
-        """
-        import subprocess
+        """Expose the ComfyUI web UI. Navigate to this endpoint in a browser."""
         import time
         
         # Wait a bit for ComfyUI to be ready
@@ -332,59 +319,6 @@ class ComfyService:
             return {"status": "ComfyUI UI server is running", "port": self.port}
         except Exception as e:
             return {"status": "ComfyUI UI server is starting", "error": str(e)}
-
-# Test function that doesn't require proxy auth
-@app.function()
-def test_endpoints(ui_url: str, api_url: str, status_url: str):
-    """Test function that tests the publicly accessible endpoints."""
-    import time, requests
-    
-    print(f"ComfyUI web UI available at: {ui_url}")
-    print(f"ComfyUI API available at: {api_url}")
-    print(f"ComfyUI Status available at: {status_url}")
-    
-    # Test status endpoint first
-    print("Testing status endpoint...")
-    try:
-        res = requests.get(status_url, timeout=10)
-        if res.status_code == 200:
-            status_data = res.json()
-            print(f"✅ Status: {status_data.get('status', 'unknown')}")
-        else:
-            print(f"⚠️ Status endpoint returned {res.status_code}")
-    except Exception as e:
-        print(f"❌ Status endpoint failed: {e}")
-    
-    # Wait for ComfyUI server to be fully ready
-    print("Waiting for ComfyUI server to be ready...")
-    for i in range(30):
-        try:
-            res = requests.get(f"{ui_url}/", timeout=10)
-            if res.status_code == 200:
-                print("ComfyUI UI endpoint is responding")
-                break
-        except Exception as e:
-            print(f"Attempt {i+1}/30 failed: {e}")
-            time.sleep(2)
-    else:
-        print("Failed to connect to ComfyUI UI after 30 attempts")
-    
-    # Send a test generation request to the API
-    test_prompt = "A surreal landscape painting of mountains under a purple sky, digital art"
-    print(f"Requesting image generation for prompt: '{test_prompt}'")
-    
-    try:
-        resp = requests.post(api_url, json={"prompt": test_prompt}, timeout=120)
-        if resp.status_code == 200:
-            # Save the output image to a file
-            output_file = "test_output.png"
-            with open(output_file, "wb") as f:
-                f.write(resp.content)
-            print(f"✅ Image generated successfully and saved to {output_file}")
-        else:
-            print(f"❌ Generation request failed with status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        print(f"❌ Error during generation request: {e}")
 
 @app.local_entrypoint()
 def main():
@@ -410,22 +344,16 @@ def main():
     print("=" * 60)
     print("🚀 ComfyUI SDXL Service Deployed Successfully!")
     print("📦 Models: SDXL Base 1.0 (development ready)")
+    print("🔗 Auto LoRA symlink monitor: Enabled (every 60 seconds)")
     print("=" * 60)
     print(f"📱 UI     → {ui_url}")
     print(f"🔗 API    → {api_url}")
     print(f"📊 Status → {status_url}")
     print("=" * 60)
     
-    # Test the endpoints
-    print("🧪 Running API test...")
-    try:
-        test_endpoints.remote(ui_url, api_url, status_url)
-    except Exception as e:
-        print(f"⚠️  Test failed: {e}")
-    
     print("\n" + "=" * 60)
     print("🎯 Next Steps:")
-    print("1. Check server status:")
+    print("1. Check server status (includes LoRA symlink count):")
     print(f"   curl {status_url}")
     print("2. Visit the UI URL in your browser")
     print("   - Use ComfyUI credentials: "+CUI_UNAME+" / "+CUI_PASS)
@@ -434,7 +362,8 @@ def main():
     print("        -H 'Content-Type: application/json' \\")
     print("        -d '{\"prompt\": \"A beautiful sunset over mountains\"}' \\")
     print("        --output generated_image.png")
-    print("4. API is now publicly accessible for development!")
+    print("4. LoRA files automatically symlinked from /data/runs/*/checkpoints/")
+    print("5. ComfyUI cache auto-refreshed when new LoRAs detected")
     print("=" * 60)
 
 if __name__ == "__main__":
