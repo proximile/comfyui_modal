@@ -91,6 +91,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "cron", force_build=FORCE_REBUILD)
     .pip_install("fastapi[standard]==0.115.4")
+    .pip_install("httpx")  # Add this line
     .pip_install("comfy-cli==1.4.1")
     .pip_install("huggingface_hub[hf_transfer]==0.30.0")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
@@ -574,27 +575,80 @@ class ComfyServiceV2:
 
     @modal.web_server(port, label="comfyui-ui-v2")
     def serve_ui(self):
-        """Expose the ComfyUI web UI. Navigate to this endpoint in a browser."""
-        import time
+        """Expose the ComfyUI web UI by proxying to the internal server."""
+        from fastapi import FastAPI, Request, Response
+        from fastapi.responses import HTMLResponse
+        import httpx
         import base64
         
-        # Wait a bit for ComfyUI to be ready
-        time.sleep(2)
+        ui_app = FastAPI()
         
-        # Check if ComfyUI is running
-        try:
-            import urllib.request
-            # Create basic auth header for ComfyUI
-            auth_string = f"{CUI_UNAME}:{CUI_PASS}"
-            auth_bytes = auth_string.encode('ascii')
-            auth_header = base64.b64encode(auth_bytes).decode('ascii')
+        # Create auth header for proxying to ComfyUI
+        auth_string = f"{CUI_UNAME}:{CUI_PASS}"
+        auth_bytes = auth_string.encode('ascii')
+        auth_header = base64.b64encode(auth_bytes).decode('ascii')
+        
+        @ui_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+        async def proxy_to_comfyui(request: Request, path: str = ""):
+            """Proxy all requests to the internal ComfyUI server."""
             
-            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/")
-            req.add_header('Authorization', f'Basic {auth_header}')
-            urllib.request.urlopen(req, timeout=5)
-            return {"status": "ComfyUI UI server is running", "port": self.port, "version": "2.0.0"}
-        except Exception as e:
-            return {"status": "ComfyUI UI server is starting", "error": str(e), "version": "2.0.0"}
+            # Build the target URL
+            target_url = f"http://127.0.0.1:{self.port}/{path}"
+            if request.url.query:
+                target_url += f"?{request.url.query}"
+            
+            # Prepare headers
+            headers = dict(request.headers)
+            headers["Authorization"] = f"Basic {auth_header}"
+            
+            # Remove hop-by-hop headers
+            hop_by_hop = [
+                "connection", "keep-alive", "proxy-authenticate", 
+                "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"
+            ]
+            for header in hop_by_hop:
+                headers.pop(header, None)
+            
+            try:
+                async with httpx.AsyncClient() as client:
+                    # Handle different request methods
+                    if request.method == "GET":
+                        response = await client.get(target_url, headers=headers, timeout=30.0)
+                    elif request.method == "POST":
+                        body = await request.body()
+                        response = await client.post(target_url, content=body, headers=headers, timeout=30.0)
+                    elif request.method == "PUT":
+                        body = await request.body()
+                        response = await client.put(target_url, content=body, headers=headers, timeout=30.0)
+                    elif request.method == "DELETE":
+                        response = await client.delete(target_url, headers=headers, timeout=30.0)
+                    elif request.method == "PATCH":
+                        body = await request.body()
+                        response = await client.patch(target_url, content=body, headers=headers, timeout=30.0)
+                    elif request.method == "OPTIONS":
+                        response = await client.options(target_url, headers=headers, timeout=30.0)
+                    else:
+                        return Response("Method not allowed", status_code=405)
+                    
+                    # Prepare response headers
+                    response_headers = dict(response.headers)
+                    # Remove hop-by-hop headers from response
+                    for header in hop_by_hop:
+                        response_headers.pop(header, None)
+                    
+                    # Return the response
+                    return Response(
+                        content=response.content,
+                        status_code=response.status_code,
+                        headers=response_headers
+                    )
+                    
+            except httpx.RequestError as e:
+                return Response(f"Proxy error: {str(e)}", status_code=502)
+            except Exception as e:
+                return Response(f"Internal error: {str(e)}", status_code=500)
+        
+        return ui_app
 
 @app.local_entrypoint()
 def main():
