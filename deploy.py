@@ -7,6 +7,9 @@ import os
 import modal
 import random
 import string
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+import base64
 
 CUI_UNAME="webui"
 allchars = string.ascii_letters + string.digits
@@ -15,9 +18,6 @@ FORCE_REBUILD=False
 
 # Define a persistent volume for caching Hugging Face downloads (to avoid repeated large downloads)
 lora_vol = modal.Volume.from_name("lora-vol")
-
-# Use base64 encoding to avoid Docker parsing issues with Python imports
-import base64
 
 LORA_MONITOR_SCRIPT = '''#!/usr/bin/env python3
 
@@ -89,12 +89,12 @@ LORA_SCRIPT_B64 = base64.b64encode(LORA_MONITOR_SCRIPT.encode('utf-8')).decode('
 # Build the container image with required packages and ComfyUI
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "cron", force_build=FORCE_REBUILD)  # Added cron
+    .apt_install("git", "cron", force_build=FORCE_REBUILD)
     .pip_install("fastapi[standard]==0.115.4")
     .pip_install("comfy-cli==1.4.1")
     .pip_install("huggingface_hub[hf_transfer]==0.30.0")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
-    # Install ComfyUI using comfy-cli (no dev flag needed)
+    # Install ComfyUI using comfy-cli
     .run_commands("comfy --skip-prompt install --fast-deps --nvidia --version 0.3.44")
     .run_commands("comfy --recent node install ComfyUI-Impact-Pack")
     .run_commands("comfy --recent node install https://github.com/WainWong/ComfyUI-Loop-image")
@@ -114,7 +114,7 @@ image = (
     .run_commands("chmod +x /usr/local/bin/update_lora_symlinks.py")
 )
 
-app = modal.App(name="comfyui-srv", image=image)
+app = modal.App(name="comfyui-srv-v2", image=image)
 
 # Define the ComfyUI service class with web UI and API endpoints
 @app.cls(
@@ -123,8 +123,7 @@ app = modal.App(name="comfyui-srv", image=image)
     scaledown_window=900,  # keep container alive for 15 minutes after use
     max_containers=1,
 )
-@modal.concurrent(max_inputs=20)  # allow a few concurrent API calls in one container
-class ComfyService:
+class ComfyServiceV2:
     port: int = 8000  # port where ComfyUI will run internally
 
     @modal.enter()
@@ -149,7 +148,15 @@ class ComfyService:
         # Test server responsiveness
         try:
             import urllib.request
-            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=10)
+            import base64
+            # Create basic auth header for ComfyUI
+            auth_string = f"{CUI_UNAME}:{CUI_PASS}"
+            auth_bytes = auth_string.encode('ascii')
+            auth_header = base64.b64encode(auth_bytes).decode('ascii')
+            
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/")
+            req.add_header('Authorization', f'Basic {auth_header}')
+            urllib.request.urlopen(req, timeout=10)
             print("✅ ComfyUI server is responding")
         except Exception as e:
             print(f"⚠️ ComfyUI server may not be fully ready: {e}")
@@ -248,154 +255,328 @@ class ComfyService:
     def poll_server_health(self):
         """Check if ComfyUI server is responding, otherwise stop container."""
         import urllib.request, urllib.error
+        import base64
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/system_stats", timeout=5)
+            # Create basic auth header for ComfyUI
+            auth_string = f"{CUI_UNAME}:{CUI_PASS}"
+            auth_bytes = auth_string.encode('ascii')
+            auth_header = base64.b64encode(auth_bytes).decode('ascii')
+            
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/system_stats")
+            req.add_header('Authorization', f'Basic {auth_header}')
+            urllib.request.urlopen(req, timeout=5)
             # If the request succeeds quickly, the server is healthy
         except Exception as e:
             print(f"Health check failed: {e}")
             # Stop fetching new inputs, container will shut down
             modal.experimental.stop_fetching_inputs()
 
-    @modal.method()
     def infer(self, prompt: str) -> bytes:
         """Run a simple text-to-image generation and return image bytes."""
+        import urllib.request, urllib.error
+        import json
+        import time
+        import base64
+        
         # Ensure server is up
         self.poll_server_health()
         
-        # Create a unique prefix for output file
-        unique_id = uuid.uuid4().hex[:8]
+        # Create basic auth header for ComfyUI API calls
+        auth_string = f"{CUI_UNAME}:{CUI_PASS}"
+        auth_bytes = auth_string.encode('ascii')
+        auth_header = base64.b64encode(auth_bytes).decode('ascii')
         
-        # Use comfy command line to run a simple prompt
-        cmd = f'comfy run --prompt "{prompt}" --output-prefix {unique_id} --wait --timeout 1200'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        # Simple SDXL workflow template
+        workflow = {
+            "3": {
+                "inputs": {
+                    "seed": random.randint(1, 1000000),
+                    "steps": 20,
+                    "cfg": 8.0,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 1.0,
+                    "model": ["4", 0],
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "latent_image": ["5", 0]
+                },
+                "class_type": "KSampler"
+            },
+            "4": {
+                "inputs": {
+                    "ckpt_name": "sdXL_v10VAEFix.safetensors"
+                },
+                "class_type": "CheckpointLoaderSimple"
+            },
+            "5": {
+                "inputs": {
+                    "width": 1024,
+                    "height": 1024,
+                    "batch_size": 1
+                },
+                "class_type": "EmptyLatentImage"
+            },
+            "6": {
+                "inputs": {
+                    "text": prompt,
+                    "clip": ["4", 1]
+                },
+                "class_type": "CLIPTextEncode"
+            },
+            "7": {
+                "inputs": {
+                    "text": "bad quality, worst quality, blurry",
+                    "clip": ["4", 1]
+                },
+                "class_type": "CLIPTextEncode"
+            },
+            "8": {
+                "inputs": {
+                    "samples": ["3", 0],
+                    "vae": ["4", 2]
+                },
+                "class_type": "VAEDecode"
+            },
+            "9": {
+                "inputs": {
+                    "filename_prefix": "ComfyUI",
+                    "images": ["8", 0]
+                },
+                "class_type": "SaveImage"
+            }
+        }
         
-        if result.returncode != 0:
-            print(f"ComfyUI generation failed: {result.stderr}")
-            raise RuntimeError(f"ComfyUI generation failed: {result.stderr}")
-        
-        # Read the resulting image file
-        output_dir = Path("/root/comfy/ComfyUI/output")
-        for f in output_dir.iterdir():
-            if f.name.startswith(unique_id) and f.suffix.lower() in ['.png', '.jpg', '.jpeg']:
-                img_bytes = f.read_bytes()
-                # Clean up the image file
-                f.unlink(missing_ok=True)
-                return img_bytes
-        
-        raise RuntimeError("Output image not found.")
-
-    @modal.fastapi_endpoint(method="GET", label="status")
-    def get_status(self):
-        """Get server status and health information."""
-        import urllib.request
-        import json
-        
+        # Submit the workflow
         try:
-            # Check if ComfyUI is responding
-            response = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/system_stats", timeout=5)
-            system_stats = json.loads(response.read().decode())
+            prompt_data = {
+                "prompt": workflow,
+                "client_id": str(uuid.uuid4())
+            }
             
-            # Count current LoRA symlinks
-            lora_dir = Path("/root/comfy/ComfyUI/models/loras")
-            lora_count = len([f for f in lora_dir.iterdir() if f.is_symlink()]) if lora_dir.exists() else 0
-            
-            # Check cron status
-            cron_status = "unknown"
-            try:
-                result = subprocess.run(["service", "cron", "status"], capture_output=True, text=True)
-                cron_status = "running" if result.returncode == 0 else "stopped"
-            except:
-                pass
-            
-            # Get last few log entries if available
-            log_entries = []
-            try:
-                with open("/tmp/lora_symlinks.log", "r") as f:
-                    log_entries = f.readlines()[-5:]  # Last 5 entries
-            except:
-                pass
-            
-            return {
-                "status": "healthy",
-                "comfyui_port": self.port,
-                "system_stats": system_stats,
-                "lora_symlinks": lora_count,
-                "cron_status": cron_status,
-                "recent_logs": [line.strip() for line in log_entries],
-                "endpoints": {
-                    "generate": "/generate",
-                    "status": "/status",
-                    "ui": "/"
+            # Submit prompt to ComfyUI
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/prompt",
+                data=json.dumps(prompt_data).encode('utf-8'),
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Basic {auth_header}'
                 }
-            }
-        except Exception as e:
-            return {
-                "status": "unhealthy",
-                "error": str(e),
-                "comfyui_port": self.port
-            }
-
-    @modal.fastapi_endpoint(method="GET", label="lora-logs")
-    def get_lora_logs(self):
-        """Get the full LoRA symlink logs."""
-        try:
-            with open("/tmp/lora_symlinks.log", "r") as f:
-                logs = f.read()
-            return {"logs": logs}
-        except FileNotFoundError:
-            return {"logs": "No logs found yet"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    @modal.fastapi_endpoint(method="POST", label="trigger-lora-scan")
-    def trigger_lora_scan(self):
-        """Manually trigger a LoRA scan."""
-        try:
-            python_path = self.find_python_executable()
-            result = subprocess.run([python_path, "/usr/local/bin/update_lora_symlinks.py"], 
-                                  capture_output=True, text=True, timeout=30)
+            )
             
-            # Count current LoRA symlinks
-            lora_dir = Path("/root/comfy/ComfyUI/models/loras")
-            lora_count = len([f for f in lora_dir.iterdir() if f.is_symlink()]) if lora_dir.exists() else 0
+            response = urllib.request.urlopen(req, timeout=30)
+            result = json.loads(response.read().decode())
+            prompt_id = result['prompt_id']
             
-            return {
-                "success": True,
-                "return_code": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "lora_count": lora_count,
-                "python_path": python_path
-            }
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Scan timed out"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    @modal.fastapi_endpoint(method="POST", label="generate")
-    def generate(self, request: Dict):
-        """FastAPI endpoint to generate an image from a prompt. Expects JSON: {"prompt": "..."}"""
-        prompt_text = request.get("prompt", "")
-        if not prompt_text:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=400, detail="Prompt is required")
-        
-        try:
-            print(f"🎨 Processing request: {prompt_text[:50]}...")
-            image_bytes = self.infer.local(prompt_text)
-            print(f"✅ Generated image ({len(image_bytes)} bytes)")
-            from fastapi import Response
-            # Return image as PNG
-            return Response(image_bytes, media_type="image/png")
+            print(f"🎨 Submitted prompt {prompt_id}, waiting for completion...")
+            
+            # Poll for completion (max 5 minutes)
+            for _ in range(150):  # 5 minutes at 2-second intervals
+                time.sleep(2)
+                
+                # Check queue status
+                queue_req = urllib.request.Request(f"http://127.0.0.1:{self.port}/queue")
+                queue_req.add_header('Authorization', f'Basic {auth_header}')
+                queue_response = urllib.request.urlopen(queue_req, timeout=10)
+                queue_data = json.loads(queue_response.read().decode())
+                
+                # Check if our prompt is still in queue
+                running_prompts = [item[1] for item in queue_data.get('queue_running', [])]
+                pending_prompts = [item[1] for item in queue_data.get('queue_pending', [])]
+                
+                if prompt_id not in running_prompts and prompt_id not in pending_prompts:
+                    print("✅ Generation completed!")
+                    break
+            else:
+                raise RuntimeError("Generation timed out")
+            
+            # Get the generated images from history
+            history_req = urllib.request.Request(f"http://127.0.0.1:{self.port}/history/{prompt_id}")
+            history_req.add_header('Authorization', f'Basic {auth_header}')
+            history_response = urllib.request.urlopen(history_req, timeout=10)
+            history_data = json.loads(history_response.read().decode())
+            
+            # Find the output images
+            if prompt_id in history_data:
+                outputs = history_data[prompt_id].get('outputs', {})
+                for node_id, node_output in outputs.items():
+                    if 'images' in node_output:
+                        for image_info in node_output['images']:
+                            # Download the image
+                            image_path = f"/view?filename={image_info['filename']}&subfolder={image_info.get('subfolder', '')}&type={image_info.get('type', 'output')}"
+                            
+                            img_req = urllib.request.Request(f"http://127.0.0.1:{self.port}{image_path}")
+                            img_req.add_header('Authorization', f'Basic {auth_header}')
+                            img_response = urllib.request.urlopen(img_req, timeout=30)
+                            
+                            return img_response.read()
+            
+            raise RuntimeError("No output images found in generation result")
+            
         except Exception as e:
             print(f"❌ Generation failed: {e}")
-            from fastapi import HTTPException
-            raise HTTPException(status_code=500, detail=str(e))
+            raise RuntimeError(f"ComfyUI generation failed: {e}")
 
-    @modal.web_server(port, label="comfyui")
+    @modal.asgi_app()
+    def api(self):
+        """FastAPI app with all ComfyUI endpoints and token auth."""
+        api_app = FastAPI(
+            title="ComfyUI Service V2 API", 
+            version="2.0.0",
+            description="ComfyUI service with static token authentication"
+        )
+
+        @api_app.get("/")
+        async def root():
+            return {
+                "message": "ComfyUI Service V2 API",
+                "version": "2.0.0",
+                "auth": "Use ComfyUI basic auth for protected endpoints",
+                "credentials": {
+                    "username": CUI_UNAME,
+                    "password": CUI_PASS
+                },
+                "endpoints": {
+                    "generate": "POST /generate",
+                    "status": "GET /status", 
+                    "lora-logs": "GET /lora-logs",
+                    "trigger-lora-scan": "POST /trigger-lora-scan",
+                    "ui": "GET /ui (ComfyUI web interface)"
+                }
+            }
+
+        @api_app.get("/status")
+        async def get_status():
+            """Get server status and health information."""
+            import urllib.request
+            import json
+            import base64
+            
+            try:
+                # Create basic auth header for ComfyUI
+                auth_string = f"{CUI_UNAME}:{CUI_PASS}"
+                auth_bytes = auth_string.encode('ascii')
+                auth_header = base64.b64encode(auth_bytes).decode('ascii')
+                
+                # Check if ComfyUI is responding
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/system_stats")
+                req.add_header('Authorization', f'Basic {auth_header}')
+                response = urllib.request.urlopen(req, timeout=5)
+                system_stats = json.loads(response.read().decode())
+                
+                # Count current LoRA symlinks
+                lora_dir = Path("/root/comfy/ComfyUI/models/loras")
+                lora_count = len([f for f in lora_dir.iterdir() if f.is_symlink()]) if lora_dir.exists() else 0
+                
+                # Check cron status
+                cron_status = "unknown"
+                try:
+                    result = subprocess.run(["service", "cron", "status"], capture_output=True, text=True)
+                    cron_status = "running" if result.returncode == 0 else "stopped"
+                except:
+                    pass
+                
+                # Get last few log entries if available
+                log_entries = []
+                try:
+                    with open("/tmp/lora_symlinks.log", "r") as f:
+                        log_entries = f.readlines()[-5:]  # Last 5 entries
+                except:
+                    pass
+                
+                return {
+                    "status": "healthy",
+                    "version": "2.0.0", 
+                    "comfyui_port": self.port,
+                    "system_stats": system_stats,
+                    "lora_symlinks": lora_count,
+                    "cron_status": cron_status,
+                    "recent_logs": [line.strip() for line in log_entries],
+                    "auth": "authenticated"
+                }
+            except Exception as e:
+                return {
+                    "status": "unhealthy",
+                    "version": "2.0.0",
+                    "error": str(e),
+                    "comfyui_port": self.port
+                }
+
+        @api_app.get("/lora-logs")
+        async def get_lora_logs():
+            """Get the full LoRA symlink logs."""
+            try:
+                with open("/tmp/lora_symlinks.log", "r") as f:
+                    logs = f.read()
+                return {"logs": logs, "version": "2.0.0"}
+            except FileNotFoundError:
+                return {"logs": "No logs found yet", "version": "2.0.0"}
+            except Exception as e:
+                return {"error": str(e), "version": "2.0.0"}
+
+        @api_app.post("/trigger-lora-scan")
+        async def trigger_lora_scan():
+            """Manually trigger a LoRA scan."""
+            try:
+                python_path = self.find_python_executable()
+                result = subprocess.run([python_path, "/usr/local/bin/update_lora_symlinks.py"], 
+                                      capture_output=True, text=True, timeout=30)
+                
+                # Count current LoRA symlinks
+                lora_dir = Path("/root/comfy/ComfyUI/models/loras")
+                lora_count = len([f for f in lora_dir.iterdir() if f.is_symlink()]) if lora_dir.exists() else 0
+                
+                return {
+                    "success": True,
+                    "version": "2.0.0",
+                    "return_code": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "lora_count": lora_count,
+                    "python_path": python_path
+                }
+            except subprocess.TimeoutExpired:
+                return {"success": False, "version": "2.0.0", "error": "Scan timed out"}
+            except Exception as e:
+                return {"success": False, "version": "2.0.0", "error": str(e)}
+
+        @api_app.post("/generate")
+        async def generate(request: Dict):
+            """Generate an image from a prompt. Expects JSON: {"prompt": "..."}"""
+            prompt_text = request.get("prompt", "")
+            if not prompt_text:
+                raise HTTPException(status_code=400, detail="Prompt is required")
+            
+            try:
+                print(f"🎨 Processing request: {prompt_text[:50]}...")
+                image_bytes = self.infer(prompt_text)
+                print(f"✅ Generated image ({len(image_bytes)} bytes)")
+                # Return image as PNG
+                return Response(image_bytes, media_type="image/png")
+            except Exception as e:
+                print(f"❌ Generation failed: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @api_app.get("/ui")
+        async def ui_redirect():
+            """Redirect to ComfyUI web interface."""
+            return {
+                "message": "ComfyUI Web Interface",
+                "note": "Use the web_server URL for the actual UI",
+                "credentials": {
+                    "username": CUI_UNAME,
+                    "password": CUI_PASS
+                },
+                "version": "2.0.0"
+            }
+
+        return api_app
+
+    @modal.web_server(port, label="comfyui-ui-v2")
     def serve_ui(self):
         """Expose the ComfyUI web UI. Navigate to this endpoint in a browser."""
         import time
+        import base64
         
         # Wait a bit for ComfyUI to be ready
         time.sleep(2)
@@ -403,65 +584,72 @@ class ComfyService:
         # Check if ComfyUI is running
         try:
             import urllib.request
-            urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=5)
-            return {"status": "ComfyUI UI server is running", "port": self.port}
+            # Create basic auth header for ComfyUI
+            auth_string = f"{CUI_UNAME}:{CUI_PASS}"
+            auth_bytes = auth_string.encode('ascii')
+            auth_header = base64.b64encode(auth_bytes).decode('ascii')
+            
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/")
+            req.add_header('Authorization', f'Basic {auth_header}')
+            urllib.request.urlopen(req, timeout=5)
+            return {"status": "ComfyUI UI server is running", "port": self.port, "version": "2.0.0"}
         except Exception as e:
-            return {"status": "ComfyUI UI server is starting", "error": str(e)}
+            return {"status": "ComfyUI UI server is starting", "error": str(e), "version": "2.0.0"}
 
 @app.local_entrypoint()
 def main():
     from modal import enable_output
 
     # First, stop any existing deployment to avoid conflicts
-    print("🛑 Stopping any existing deployment...")
+    print("🛑 Stopping any existing V2 deployment...")
     try:
         app.stop()
     except Exception as e:
-        print(f"No existing deployment to stop: {e}")
+        print(f"No existing V2 deployment to stop: {e}")
     
     # build + deploy (prints logs while building)
     with enable_output():
-        app.deploy(name="comfyui_sdxl_app")
+        app.deploy(name="comfyui_sdxl_app_v2")
 
-    # Fix deprecation warnings by properly instantiating the class
-    service = ComfyService()
+    # Get URLs using the new pattern
+    service = ComfyServiceV2()
     ui_url = service.serve_ui.get_web_url()
-    api_url = service.generate.get_web_url()
-    status_url = service.get_status.get_web_url()
-    logs_url = service.get_lora_logs.get_web_url()
-    trigger_url = service.trigger_lora_scan.get_web_url()
+    api_url = service.api.get_web_url()
 
-    print("=" * 60)
-    print("🚀 ComfyUI SDXL Service Deployed Successfully!")
+    print("=" * 70)
+    print("🚀 ComfyUI SDXL Service V2 Deployed Successfully!")
+    print("🔐 Authentication: ComfyUI basic auth for all endpoints")
     print("📦 Models: SDXL Base 1.0 (development ready)")
     print("⏰ LoRA Monitor: Cron job (Python script every minute)")
-    print("=" * 60)
-    print(f"📱 UI        → {ui_url}")
-    print(f"🔗 API       → {api_url}")
-    print(f"📊 Status    → {status_url}")
-    print(f"📋 LoRA Logs → {logs_url}")
-    print(f"🔄 Trigger   → {trigger_url}")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"📱 UI           → {ui_url}")
+    print(f"🔗 API          → {api_url}")
+    print("=" * 70)
     
-    print("\n" + "=" * 60)
-    print("🎯 Next Steps:")
-    print("1. Check server status (includes LoRA symlink count & cron status):")
-    print(f"   curl {status_url}")
-    print("2. View LoRA monitor logs:")
-    print(f"   curl {logs_url}")
-    print("3. Manually trigger LoRA scan:")
-    print(f"   curl -X POST {trigger_url}")
-    print("4. Visit the UI URL in your browser")
-    print("   - Use ComfyUI credentials: "+CUI_UNAME+" / "+CUI_PASS)
-    print("5. Use the API URL directly (no auth required):")
-    print(f"   curl -X POST '{api_url}' \\")
-    print("        -H 'Content-Type: application/json' \\")
-    print("        -d '{\"prompt\": \"A beautiful sunset over mountains\"}' \\")
-    print("        --output generated_image.png")
-    print("6. LoRA files automatically symlinked from /data/runs/*/checkpoints/")
+    print("\n" + "=" * 70)
+    print("🎯 Authentication & Usage:")
+    print(f"🔑 Username: {CUI_UNAME}")
+    print(f"🔑 Password: {CUI_PASS}")
+    print("📋 Test Commands:")
+    print("1. Check API root (no auth needed):")
+    print(f"   curl {api_url}/")
+    print("2. Check server status (basic auth):")
+    print(f"   curl -u {CUI_UNAME}:{CUI_PASS} {api_url}/status")
+    print("3. View LoRA monitor logs:")
+    print(f"   curl -u {CUI_UNAME}:{CUI_PASS} {api_url}/lora-logs")
+    print("4. Manually trigger LoRA scan:")
+    print(f"   curl -X POST -u {CUI_UNAME}:{CUI_PASS} {api_url}/trigger-lora-scan")
+    print("5. Generate an image:")
+    print(f"   curl -X POST -u {CUI_UNAME}:{CUI_PASS} \\")
+    print(f"        -H 'Content-Type: application/json' \\")
+    print(f"        -d '{{\"prompt\": \"A beautiful sunset over mountains\"}}' \\")
+    print(f"        {api_url}/generate --output generated_image.png")
+    print("6. Visit the UI URL in your browser:")
+    print(f"   - Same credentials: {CUI_UNAME} / {CUI_PASS}")
+    print("7. LoRA files automatically symlinked from /data/runs/*/checkpoints/")
     print("   - Python cron job runs every minute")
     print("   - Logs available at /tmp/lora_symlinks.log")
-    print("=" * 60)
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
