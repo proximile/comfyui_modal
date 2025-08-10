@@ -47,11 +47,18 @@ MODEL_DIRECTORIES = [
     "text_encoders", 
     "vae",
     "clip_vision",
-    "loras"
+    "loras",
+    "embeddings",       # For text embeddings
+    "clip",            # For CLIP models
+    "unet",            # For standalone UNet models
+    "flux"             # For Flux models directory
 ]
 
-# Hugging Face downloads: (repo, files, target_dir)
-HF_DOWNLOADS = [
+# Control video model downloads with environment variable
+DOWNLOAD_VIDEO_MODELS = os.getenv("DOWNLOAD_VIDEO_MODELS", "false").lower() == "true"
+
+# Video models (Hunyuan Video and WAN) - large downloads
+VIDEO_MODEL_DOWNLOADS = [
     # Hunyuan Video models
     ("Comfy-Org/HunyuanVideo_repackaged", [
         "split_files/diffusion_models/hunyuan_video_v2_replace_image_to_video_720p_bf16.safetensors",
@@ -91,7 +98,10 @@ HF_DOWNLOADS = [
     ("Kijai/WanVideo_comfy", [
         "Wan21_CausVid_14B_T2V_lora_rank32.safetensors"
     ], "loras"),
-    
+]
+
+# Base models (SDXL and essential components) - always downloaded
+BASE_MODEL_DOWNLOADS = [
     # SDXL Base Model
     ("stabilityai/stable-diffusion-xl-base-1.0", [
         "sd_xl_base_1.0.safetensors"
@@ -130,6 +140,11 @@ HF_DOWNLOADS = [
     #], "unet"),
 ]
 
+# Combine models based on settings
+HF_DOWNLOADS = BASE_MODEL_DOWNLOADS.copy()
+if DOWNLOAD_VIDEO_MODELS:
+    HF_DOWNLOADS.extend(VIDEO_MODEL_DOWNLOADS)
+
 # Custom nodes repositories
 CUSTOM_NODES = [
     "https://github.com/kijai/ComfyUI-HunyuanVideoWrapper",
@@ -161,7 +176,7 @@ image = (
     )
 )
 
-# Download HuggingFace models
+# Download HuggingFace models (video models only included if DOWNLOAD_VIDEO_MODELS=true)
 for repo, files, target_dir in HF_DOWNLOADS:
     for file in files:
         image = image.run_commands(
@@ -238,27 +253,60 @@ def comfyui_server():
     comfy_checkpoints = comfy_models / "checkpoints"
     comfy_loras = comfy_models / "loras" 
     comfy_vae = comfy_models / "vae"
+    comfy_embeddings = comfy_models / "embeddings"
+    comfy_text_encoders = comfy_models / "text_encoders"
+    comfy_clip = comfy_models / "clip"
+    comfy_clip_vision = comfy_models / "clip_vision"
+    comfy_diffusion_models = comfy_models / "diffusion_models"
+    comfy_unet = comfy_models / "unet"
     
     # Create specialized lora subdirectories
     loras_trained = comfy_loras / "trained"
     loras_hunyuan = comfy_loras / "hunyuan"
+    loras_extra = comfy_loras / "extra"
     loras_trained.mkdir(exist_ok=True)
     loras_hunyuan.mkdir(exist_ok=True)
+    loras_extra.mkdir(exist_ok=True)
     
     print("=== Setting up volume symlinks ===")
     
-    # 1. Symlink .safetensors files from /data/models/ (root level only) to checkpoints/
-    print("\n1. Symlinking checkpoints from volume root...")
-    volume_checkpoints = list(volume_models_dir.glob("*.safetensors"))
-    for checkpoint in volume_checkpoints:
+    # 1. Symlink .safetensors files from /data/models/ (root level) - separate Flux models from checkpoints
+    print("\n1. Symlinking models from volume root...")
+    volume_model_files = list(volume_models_dir.glob("*.safetensors"))
+    flux_models = []
+    checkpoint_models = []
+    
+    for model_file in volume_model_files:
+        if "flux" in model_file.name.lower():
+            flux_models.append(model_file)
+        else:
+            # All non-Flux models go to checkpoints: SDXL, Pony, Illustrious, CyberRealistic, etc.
+            checkpoint_models.append(model_file)
+    
+    # Symlink ALL checkpoint models to checkpoints/ (SDXL, Pony, Illustrious, etc.)
+    print("  1a. Symlinking checkpoint models (SDXL, Pony, Illustrious, CyberRealistic, etc.)...")
+    for checkpoint in checkpoint_models:
         link_path = comfy_checkpoints / checkpoint.name
         if not link_path.exists():
             try:
                 link_path.symlink_to(checkpoint)
-                print(f"  ✓ {checkpoint.name}")
+                print(f"    ✓ {checkpoint.name}")
             except Exception as e:
-                print(f"  ✗ Failed to link {checkpoint.name}: {e}")
-    print(f"  Total: {len(volume_checkpoints)} checkpoint files linked")
+                print(f"    ✗ Failed to link {checkpoint.name}: {e}")
+    print(f"    Total: {len(checkpoint_models)} checkpoint files linked")
+    
+    # Symlink Flux models to diffusion_models/
+    print("  1b. Symlinking Flux models...")
+    comfy_diffusion_models.mkdir(exist_ok=True)
+    for flux_model in flux_models:
+        link_path = comfy_diffusion_models / flux_model.name
+        if not link_path.exists():
+            try:
+                link_path.symlink_to(flux_model)
+                print(f"    ✓ {flux_model.name}")
+            except Exception as e:
+                print(f"    ✗ Failed to link {flux_model.name}: {e}")
+    print(f"    Total: {len(flux_models)} Flux model files linked")
     
     # 2. Symlink trained LoRAs from /data/runs/*/checkpoints/*.safetensors to loras/trained/
     print("\n2. Symlinking trained LoRAs...")
@@ -313,6 +361,173 @@ def comfyui_server():
     else:
         print("  No Hunyuan LoRAs directory found in volume")
     
+    # 5. Symlink extra LoRAs from /data/models/loras/ to loras/extra/
+    print("\n5. Symlinking extra LoRAs from volume...")
+    volume_loras_dir = volume_models_dir / "loras"
+    if volume_loras_dir.exists():
+        lora_files = list(volume_loras_dir.glob("*.safetensors"))
+        for lora_file in lora_files:
+            link_path = loras_extra / lora_file.name
+            if not link_path.exists():
+                try:
+                    link_path.symlink_to(lora_file)
+                    print(f"  ✓ {lora_file.name}")
+                except Exception as e:
+                    print(f"  ✗ Failed to link {lora_file.name}: {e}")
+        print(f"  Total: {len(lora_files)} extra LoRA files linked")
+    else:
+        print("  No loras directory found in volume")
+    
+    # 6. Symlink embeddings from /data/models/embeddings/ to embeddings/
+    print("\n6. Symlinking embeddings...")
+    volume_embeddings_dir = volume_models_dir / "embeddings"
+    if volume_embeddings_dir.exists():
+        # Create embeddings directory if it doesn't exist
+        comfy_embeddings.mkdir(exist_ok=True)
+        
+        # Symlink all files in embeddings directory (safetensors, pt, bin files)
+        embedding_files = list(volume_embeddings_dir.glob("*"))
+        linked_count = 0
+        for embedding_item in embedding_files:
+            if embedding_item.is_file():
+                link_path = comfy_embeddings / embedding_item.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(embedding_item)
+                        print(f"  ✓ {embedding_item.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {embedding_item.name}: {e}")
+            elif embedding_item.is_dir():
+                # Handle subdirectories by creating them and symlinking their contents
+                subdir_path = comfy_embeddings / embedding_item.name
+                subdir_path.mkdir(exist_ok=True)
+                for subfile in embedding_item.glob("*"):
+                    if subfile.is_file():
+                        link_path = subdir_path / subfile.name
+                        if not link_path.exists():
+                            try:
+                                link_path.symlink_to(subfile)
+                                print(f"  ✓ {embedding_item.name}/{subfile.name}")
+                                linked_count += 1
+                            except Exception as e:
+                                print(f"  ✗ Failed to link {embedding_item.name}/{subfile.name}: {e}")
+        print(f"  Total: {linked_count} embedding files linked")
+    else:
+        print("  No embeddings directory found in volume")
+    
+    # 7. Symlink Flux text encoders from /data/models/flux_text_encoders/ to text_encoders/
+    print("\n7. Symlinking Flux text encoders...")
+    volume_flux_text_encoders = volume_models_dir / "flux_text_encoders"
+    if volume_flux_text_encoders.exists():
+        # Create text_encoders directory if it doesn't exist
+        comfy_text_encoders.mkdir(exist_ok=True)
+        
+        flux_encoder_files = list(volume_flux_text_encoders.glob("*"))
+        linked_count = 0
+        for encoder_file in flux_encoder_files:
+            if encoder_file.is_file():
+                link_path = comfy_text_encoders / encoder_file.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(encoder_file)
+                        print(f"  ✓ {encoder_file.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {encoder_file.name}: {e}")
+        print(f"  Total: {linked_count} Flux text encoder files linked")
+    else:
+        print("  No flux_text_encoders directory found in volume")
+    
+    # 8. Symlink Flux VAE from /data/models/flux_vae/ to vae/
+    print("\n8. Symlinking Flux VAE files...")
+    volume_flux_vae = volume_models_dir / "flux_vae"
+    if volume_flux_vae.exists():
+        flux_vae_files = list(volume_flux_vae.glob("*"))
+        linked_count = 0
+        for vae_file in flux_vae_files:
+            if vae_file.is_file():
+                link_path = comfy_vae / vae_file.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(vae_file)
+                        print(f"  ✓ {vae_file.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {vae_file.name}: {e}")
+        print(f"  Total: {linked_count} Flux VAE files linked")
+    else:
+        print("  No flux_vae directory found in volume")
+    
+    # 9. Symlink CLIP models from /data/models/clip/ to clip/
+    print("\n9. Symlinking CLIP models...")
+    volume_clip_dir = volume_models_dir / "clip"
+    if volume_clip_dir.exists():
+        # Create clip directory if it doesn't exist
+        comfy_clip.mkdir(exist_ok=True)
+        
+        clip_files = list(volume_clip_dir.glob("*"))
+        linked_count = 0
+        for clip_file in clip_files:
+            if clip_file.is_file():
+                link_path = comfy_clip / clip_file.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(clip_file)
+                        print(f"  ✓ {clip_file.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {clip_file.name}: {e}")
+        print(f"  Total: {linked_count} CLIP model files linked")
+    else:
+        print("  No clip directory found in volume")
+    
+    # 10. Symlink CLIP vision models from /data/models/clip_vision/ to clip_vision/
+    print("\n10. Symlinking CLIP vision models...")
+    volume_clip_vision_dir = volume_models_dir / "clip_vision"
+    if volume_clip_vision_dir.exists():
+        # Create clip_vision directory if it doesn't exist
+        comfy_clip_vision.mkdir(exist_ok=True)
+        
+        clip_vision_files = list(volume_clip_vision_dir.glob("*"))
+        linked_count = 0
+        for clip_vision_file in clip_vision_files:
+            if clip_vision_file.is_file():
+                link_path = comfy_clip_vision / clip_vision_file.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(clip_vision_file)
+                        print(f"  ✓ {clip_vision_file.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {clip_vision_file.name}: {e}")
+        print(f"  Total: {linked_count} CLIP vision model files linked")
+    else:
+        print("  No clip_vision directory found in volume")
+    
+    # 11. Symlink diffusion models from /data/models/diffusion_models/ to diffusion_models/
+    print("\n11. Symlinking diffusion models...")
+    volume_diffusion_models_dir = volume_models_dir / "diffusion_models"
+    if volume_diffusion_models_dir.exists():
+        # Create diffusion_models directory if it doesn't exist
+        comfy_diffusion_models.mkdir(exist_ok=True)
+        
+        diffusion_files = list(volume_diffusion_models_dir.glob("*"))
+        linked_count = 0
+        for diffusion_file in diffusion_files:
+            if diffusion_file.is_file():
+                link_path = comfy_diffusion_models / diffusion_file.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(diffusion_file)
+                        print(f"  ✓ {diffusion_file.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {diffusion_file.name}: {e}")
+        print(f"  Total: {linked_count} diffusion model files linked")
+    else:
+        print("  No diffusion_models directory found in volume")
+    
     os.chdir("/root/comfy/ComfyUI")
     
     
@@ -325,7 +540,7 @@ def comfyui_server():
         else:
             output_dir.unlink()
 
-    sample_outputs = Path("/data/outputs")
+    sample_outputs = Path("/data/sample_outputs")
     sample_outputs.mkdir(parents=True, exist_ok=True)
     print(f"Creating output symlink: {output_dir} → {sample_outputs}")
     output_dir.symlink_to(sample_outputs, target_is_directory=True)
@@ -335,12 +550,14 @@ def comfyui_server():
     
     # Built-in models
     print("\nBuilt-in models:")
-    for model_dir in ["checkpoints", "diffusion_models", "vae", "text_encoders"]:
+    for model_dir in ["checkpoints", "diffusion_models", "vae", "text_encoders", "clip", "clip_vision"]:
         model_path = comfy_root / "models" / model_dir
         if model_path.exists():
             models = list(model_path.glob("*.safetensors")) + list(model_path.glob("*.ckpt"))
             builtin_models = [m for m in models if not m.is_symlink()]
-            print(f"  {model_dir}: {len(builtin_models)} built-in models")
+            total_models = len(models)
+            volume_models = total_models - len(builtin_models)
+            print(f"  {model_dir}: {len(builtin_models)} built-in + {volume_models} from volume = {total_models} total")
     
     # LoRA structure
     print("\nLoRA structure:")
@@ -356,6 +573,10 @@ def comfyui_server():
         if loras_hunyuan.exists():
             hunyuan_count = len(list(loras_hunyuan.glob("*.safetensors")))
             print(f"  Hunyuan LoRAs: {hunyuan_count}")
+        
+        if loras_extra.exists():
+            extra_count = len(list(loras_extra.glob("*.safetensors")))
+            print(f"  Extra LoRAs: {extra_count}")
     
     # Volume checkpoints
     volume_checkpoint_count = len(list(comfy_checkpoints.glob("*.safetensors")))
@@ -506,21 +727,13 @@ def list_training_runs():
                         "path": str(checkpoint),
                         "size": checkpoint.stat().st_size
                     })
-    
-
-    sample_outputs = Path("/data/sample_outputs")
-
-    sample_outputs.mkdir(parents=True, exist_ok=True)
-    print(f"Creating symlink: {output_dir} → {sample_outputs}")
-    output_dir.symlink_to(sample_outputs, target_is_directory=True)
-
     return runs
 
 
 @app.local_entrypoint()
 def main():
     print(f"👤 Username: {USERNAME}")
-    print(f"🔑 Password: {PASSWORD}")
+    print(f"🔑 Password: {CUI_PASS}")
     print("="*70)
     print("\n📝 Notes:")
     print("- Basic auth is handled by the ComfyUI custom node")
