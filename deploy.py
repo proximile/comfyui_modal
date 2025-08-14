@@ -17,6 +17,9 @@ USERNAME = "webui"
 allchars = string.ascii_letters + string.digits
 CUI_PASS = ''.join(random.choice(allchars) for _ in range(8))
 
+# Control video model downloads
+DOWNLOAD_VIDEO_MODELS = False
+
 # Create Modal app
 app = modal.App("i2v-comfyui")
 
@@ -27,7 +30,7 @@ APT_PACKAGES = [
     "libgomp1", "libglib2.0-0"
 ]
 
-PIP_PACKAGES = ["hf_transfer", "requests"]
+PIP_PACKAGES = ["hf_transfer", "requests", "huggingface-hub"]
 
 ENVIRONMENT_VARS = {
     "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -54,9 +57,6 @@ MODEL_DIRECTORIES = [
     "flux"             # For Flux models directory
 ]
 
-# Control video model downloads with environment variable
-DOWNLOAD_VIDEO_MODELS = os.getenv("DOWNLOAD_VIDEO_MODELS", "false").lower() == "true"
-
 # Video models (Hunyuan Video and WAN) - large downloads
 VIDEO_MODEL_DOWNLOADS = [
     # Hunyuan Video models
@@ -82,7 +82,7 @@ VIDEO_MODEL_DOWNLOADS = [
         "hunyuan_video_vae_bf16.safetensors"
     ], "vae"),
     
-    # WAN models
+    # WAN 2.1 models
     ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", [
         "split_files/diffusion_models/wan2.1_vace_14B_fp16.safetensors"
     ], "diffusion_models"),
@@ -98,6 +98,23 @@ VIDEO_MODEL_DOWNLOADS = [
     ("Kijai/WanVideo_comfy", [
         "Wan21_CausVid_14B_T2V_lora_rank32.safetensors"
     ], "loras"),
+    
+    # WAN 2.2 I2V models
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", [
+        "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
+    ], "diffusion_models"),
+
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", [
+        "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
+    ], "diffusion_models"),
+    
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", [
+        "split_files/text_encoders/umt5_xxl_fp16.safetensors"
+    ], "text_encoders"),
+    
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", [
+        "split_files/vae/wan2.2_vae.safetensors"
+    ], "vae"),
 ]
 
 # Base models (SDXL and essential components) - always downloaded
@@ -138,6 +155,19 @@ BASE_MODEL_DOWNLOADS = [
     #("John6666/realism-by-stable-yogi-v50fp16-sdxl", [
     #    "diffusion_pytorch_model.safetensors"
     #], "unet"),
+    #https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev/blob/main/flux1-fill-dev.safetensors
+    ("black-forest-labs/FLUX.1-Fill-dev", [
+        "flux1-fill-dev.safetensors",
+    ], "unet"),
+
+    ("black-forest-labs/FLUX.1-schnell", [
+        "ae.safetensors",
+    ], "vae"),
+
+    ("comfyanonymous/flux_text_encoders", [
+        "clip_l.safetensors","t5xxl_fp16.safetensors",
+    ], "clip"),
+
 ]
 
 # Combine models based on settings
@@ -151,10 +181,15 @@ CUSTOM_NODES = [
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
     "https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet",
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack",
     "https://github.com/kijai/ComfyUI-KJNodes",
     "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation",
     "https://github.com/pythongosssss/ComfyUI-Custom-Scripts",
     "https://github.com/rgthree/rgthree-comfy",
+    "https://github.com/ltdrdata/ComfyUI-Inspire-Pack",
+    "https://github.com/42lux/ComfyUI-42lux",
+    "https://github.com/ClownsharkBatwing/RES4LYF",
+    "https://github.com/Xiangyu-CAS/HandFixer",
 ]
 
 # Build container image with all models included
@@ -165,6 +200,12 @@ image = (
     .run_commands("pip install --upgrade comfy-cli")
     .pip_install(*PIP_PACKAGES)
     .env(ENVIRONMENT_VARS)
+    
+    # Login to HuggingFace after installing huggingface-hub
+    .run_commands(
+        "hf auth login --token $HF_TOKEN",
+        secrets=[modal.Secret.from_name("huggingface-secret")]
+    )
     
     # Install ComfyUI
     .run_commands("comfy --skip-prompt install --nvidia --cuda-version 12.6")
@@ -179,10 +220,15 @@ image = (
 # Download HuggingFace models (video models only included if DOWNLOAD_VIDEO_MODELS=true)
 for repo, files, target_dir in HF_DOWNLOADS:
     for file in files:
+        # Extract just the filename from the path
+        filename = file.split('/')[-1]
         image = image.run_commands(
             f"hf download {repo} "
             f"{file} "
-            f"--local-dir /root/comfy/ComfyUI/models/{target_dir}"
+            f"--local-dir /tmp/download && "
+            f"mv /tmp/download/{file} /root/comfy/ComfyUI/models/{target_dir}/{filename} && "
+            f"rm -rf /tmp/download",
+            secrets=[modal.Secret.from_name("huggingface-secret")]
         )
 
 # Clone custom nodes
@@ -224,7 +270,7 @@ image = image.run_commands(
 # Web server for ComfyUI interface
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu="A100-40GB",
     scaledown_window=3000,
     volumes={"/data": VOL},
     memory=32768*4,
@@ -415,6 +461,31 @@ def comfyui_server():
         print(f"  Total: {linked_count} embedding files linked")
     else:
         print("  No embeddings directory found in volume")
+
+    
+    # 6.5 Symlink text encoders from /data/models/text_encoders/ to text_encoders/
+    print("\n7. Symlinking text encoders...")
+    volume_text_encoders = volume_models_dir / "text_encoders"
+    if volume_text_encoders.exists():
+        # Create text_encoders directory if it doesn't exist
+        comfy_text_encoders.mkdir(exist_ok=True)
+        
+        encoder_files = list(volume_text_encoders.glob("*"))
+        linked_count = 0
+        for encoder_file in encoder_files:
+            if encoder_file.is_file():
+                link_path = comfy_text_encoders / encoder_file.name
+                if not link_path.exists():
+                    try:
+                        link_path.symlink_to(encoder_file)
+                        print(f"  ✓ {encoder_file.name}")
+                        linked_count += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed to link {encoder_file.name}: {e}")
+        print(f"  Total: {linked_count} text encoder files linked")
+    else:
+        print("  No text_encoders directory found in volume")
+    
     
     # 7. Symlink Flux text encoders from /data/models/flux_text_encoders/ to text_encoders/
     print("\n7. Symlinking Flux text encoders...")
